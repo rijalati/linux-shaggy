@@ -55,6 +55,8 @@
 #include <asm/firmware.h>
 #endif
 #include <asm/code-patching.h>
+#include <asm/livepatch.h>
+
 #include <linux/kprobes.h>
 #include <linux/kdebug.h>
 
@@ -983,7 +985,7 @@ void restore_tm_state(struct pt_regs *regs)
 static inline void save_sprs(struct thread_struct *t)
 {
 #ifdef CONFIG_ALTIVEC
-	if (cpu_has_feature(cpu_has_feature(CPU_FTR_ALTIVEC)))
+	if (cpu_has_feature(CPU_FTR_ALTIVEC))
 		t->vrsave = mfspr(SPRN_VRSAVE);
 #endif
 #ifdef CONFIG_PPC_BOOK3S_64
@@ -1400,13 +1402,15 @@ int copy_thread(unsigned long clone_flags, unsigned long usp,
 	extern void ret_from_kernel_thread(void);
 	void (*f)(void);
 	unsigned long sp = (unsigned long)task_stack_page(p) + THREAD_SIZE;
+	struct thread_info *ti = task_thread_info(p);
+
+	klp_init_thread_info(ti);
 
 	/* Copy registers */
 	sp -= sizeof(struct pt_regs);
 	childregs = (struct pt_regs *) sp;
 	if (unlikely(p->flags & PF_KTHREAD)) {
 		/* kernel thread */
-		struct thread_info *ti = (void *)task_stack_page(p);
 		memset(childregs, 0, sizeof(struct pt_regs));
 		childregs->gpr[1] = sp + sizeof(struct pt_regs);
 		/* function */
