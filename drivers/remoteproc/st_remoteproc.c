@@ -189,9 +189,9 @@ static int st_rproc_parse_dt(struct platform_device *pdev)
 	}
 
 	ddata->boot_base = syscon_regmap_lookup_by_phandle(np, "st,syscfg");
-	if (!ddata->boot_base) {
+	if (IS_ERR(ddata->boot_base)) {
 		dev_err(dev, "Boot base not found\n");
-		return -EINVAL;
+		return PTR_ERR(ddata->boot_base);
 	}
 
 	err = of_property_read_u32_index(np, "st,syscfg", 1,
@@ -262,7 +262,7 @@ static int st_rproc_probe(struct platform_device *pdev)
 	return 0;
 
 free_rproc:
-	rproc_put(rproc);
+	rproc_free(rproc);
 	return ret;
 }
 
@@ -277,7 +277,7 @@ static int st_rproc_remove(struct platform_device *pdev)
 
 	of_reserved_mem_device_release(&pdev->dev);
 
-	rproc_put(rproc);
+	rproc_free(rproc);
 
 	return 0;
 }

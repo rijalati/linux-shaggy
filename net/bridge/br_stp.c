@@ -570,7 +570,7 @@ int br_set_max_age(struct net_bridge *br, unsigned long val)
  *
  * Offloaded switch entries maybe more restrictive
  */
-int br_set_ageing_time(struct net_bridge *br, u32 ageing_time)
+int br_set_ageing_time(struct net_bridge *br, clock_t ageing_time)
 {
 	struct switchdev_attr attr = {
 		.orig_dev = br->dev,
@@ -582,7 +582,7 @@ int br_set_ageing_time(struct net_bridge *br, u32 ageing_time)
 	int err;
 
 	err = switchdev_port_attr_set(br->dev, &attr);
-	if (err)
+	if (err && err != -EOPNOTSUPP)
 		return err;
 
 	br->ageing_time = t;

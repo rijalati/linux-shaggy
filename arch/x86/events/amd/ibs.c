@@ -7,7 +7,8 @@
  */
 
 #include <linux/perf_event.h>
-#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/export.h>
 #include <linux/pci.h>
 #include <linux/ptrace.h>
 #include <linux/syscore_ops.h>
@@ -28,10 +29,46 @@ static u32 ibs_caps;
 #define IBS_FETCH_CONFIG_MASK	(IBS_FETCH_RAND_EN | IBS_FETCH_MAX_CNT)
 #define IBS_OP_CONFIG_MASK	IBS_OP_MAX_CNT
 
+
+/*
+ * IBS states:
+ *
+ * ENABLED; tracks the pmu::add(), pmu::del() state, when set the counter is taken
+ * and any further add()s must fail.
+ *
+ * STARTED/STOPPING/STOPPED; deal with pmu::start(), pmu::stop() state but are
+ * complicated by the fact that the IBS hardware can send late NMIs (ie. after
+ * we've cleared the EN bit).
+ *
+ * In order to consume these late NMIs we have the STOPPED state, any NMI that
+ * happens after we've cleared the EN state will clear this bit and report the
+ * NMI handled (this is fundamentally racy in the face or multiple NMI sources,
+ * someone else can consume our BIT and our NMI will go unhandled).
+ *
+ * And since we cannot set/clear this separate bit together with the EN bit,
+ * there are races; if we cleared STARTED early, an NMI could land in
+ * between clearing STARTED and clearing the EN bit (in fact multiple NMIs
+ * could happen if the period is small enough), and consume our STOPPED bit
+ * and trigger streams of unhandled NMIs.
+ *
+ * If, however, we clear STARTED late, an NMI can hit between clearing the
+ * EN bit and clearing STARTED, still see STARTED set and process the event.
+ * If this event will have the VALID bit clear, we bail properly, but this
+ * is not a given. With VALID set we can end up calling pmu::stop() again
+ * (the throttle logic) and trigger the WARNs in there.
+ *
+ * So what we do is set STOPPING before clearing EN to avoid the pmu::stop()
+ * nesting, and clear STARTED late, so that we have a well defined state over
+ * the clearing of the EN bit.
+ *
+ * XXX: we could probably be using !atomic bitops for all this.
+ */
+
 enum ibs_states {
 	IBS_ENABLED	= 0,
 	IBS_STARTED	= 1,
 	IBS_STOPPING	= 2,
+	IBS_STOPPED	= 3,
 
 	IBS_MAX_STATES,
 };
@@ -377,11 +414,10 @@ static void perf_ibs_start(struct perf_event *event, int flags)
 
 	perf_ibs_set_period(perf_ibs, hwc, &period);
 	/*
-	 * Set STARTED before enabling the hardware, such that
-	 * a subsequent NMI must observe it. Then clear STOPPING
-	 * such that we don't consume NMIs by accident.
+	 * Set STARTED before enabling the hardware, such that a subsequent NMI
+	 * must observe it.
 	 */
-	set_bit(IBS_STARTED, pcpu->state);
+	set_bit(IBS_STARTED,    pcpu->state);
 	clear_bit(IBS_STOPPING, pcpu->state);
 	perf_ibs_enable_event(perf_ibs, hwc, period >> 4);
 
@@ -396,6 +432,9 @@ static void perf_ibs_stop(struct perf_event *event, int flags)
 	u64 config;
 	int stopping;
 
+	if (test_and_set_bit(IBS_STOPPING, pcpu->state))
+		return;
+
 	stopping = test_bit(IBS_STARTED, pcpu->state);
 
 	if (!stopping && (hwc->state & PERF_HES_UPTODATE))
@@ -405,12 +444,12 @@ static void perf_ibs_stop(struct perf_event *event, int flags)
 
 	if (stopping) {
 		/*
-		 * Set STOPPING before disabling the hardware, such that it
+		 * Set STOPPED before disabling the hardware, such that it
 		 * must be visible to NMIs the moment we clear the EN bit,
 		 * at which point we can generate an !VALID sample which
 		 * we need to consume.
 		 */
-		set_bit(IBS_STOPPING, pcpu->state);
+		set_bit(IBS_STOPPED, pcpu->state);
 		perf_ibs_disable_event(perf_ibs, hwc, config);
 		/*
 		 * Clear STARTED after disabling the hardware; if it were
@@ -556,7 +595,7 @@ fail:
 		 * with samples that even have the valid bit cleared.
 		 * Mark all this NMIs as handled.
 		 */
-		if (test_and_clear_bit(IBS_STOPPING, pcpu->state))
+		if (test_and_clear_bit(IBS_STOPPED, pcpu->state))
 			return 1;
 
 		return 0;
@@ -617,8 +656,12 @@ fail:
 	}
 
 	if (event->attr.sample_type & PERF_SAMPLE_RAW) {
-		raw.size = sizeof(u32) + ibs_data.size;
-		raw.data = ibs_data.data;
+		raw = (struct perf_raw_record){
+			.frag = {
+				.size = sizeof(u32) + ibs_data.size,
+				.data = ibs_data.data,
+			},
+		};
 		data.raw = &raw;
 	}
 
@@ -683,12 +726,9 @@ static __init int perf_ibs_pmu_init(struct perf_ibs *perf_ibs, char *name)
 	return ret;
 }
 
-static __init int perf_event_ibs_init(void)
+static __init void perf_event_ibs_init(void)
 {
 	struct attribute **attr = ibs_op_format_attrs;
-
-	if (!ibs_caps)
-		return -ENODEV;	/* ibs not supported by the cpu */
 
 	perf_ibs_pmu_init(&perf_ibs_fetch, "ibs_fetch");
 
@@ -700,13 +740,11 @@ static __init int perf_event_ibs_init(void)
 
 	register_nmi_handler(NMI_LOCAL, perf_ibs_nmi_handler, 0, "perf_ibs");
 	pr_info("perf: AMD IBS detected (0x%08x)\n", ibs_caps);
-
-	return 0;
 }
 
 #else /* defined(CONFIG_PERF_EVENTS) && defined(CONFIG_CPU_SUP_AMD) */
 
-static __init int perf_event_ibs_init(void) { return 0; }
+static __init void perf_event_ibs_init(void) { }
 
 #endif
 
@@ -883,7 +921,7 @@ static inline int get_ibs_lvt_offset(void)
 	return val & IBSCTL_LVT_OFFSET_MASK;
 }
 
-static void setup_APIC_ibs(void *dummy)
+static void setup_APIC_ibs(void)
 {
 	int offset;
 
@@ -898,7 +936,7 @@ failed:
 		smp_processor_id());
 }
 
-static void clear_APIC_ibs(void *dummy)
+static void clear_APIC_ibs(void)
 {
 	int offset;
 
@@ -907,18 +945,24 @@ static void clear_APIC_ibs(void *dummy)
 		setup_APIC_eilvt(offset, 0, APIC_EILVT_MSG_FIX, 1);
 }
 
+static int x86_pmu_amd_ibs_starting_cpu(unsigned int cpu)
+{
+	setup_APIC_ibs();
+	return 0;
+}
+
 #ifdef CONFIG_PM
 
 static int perf_ibs_suspend(void)
 {
-	clear_APIC_ibs(NULL);
+	clear_APIC_ibs();
 	return 0;
 }
 
 static void perf_ibs_resume(void)
 {
 	ibs_eilvt_setup();
-	setup_APIC_ibs(NULL);
+	setup_APIC_ibs();
 }
 
 static struct syscore_ops perf_ibs_syscore_ops = {
@@ -937,27 +981,15 @@ static inline void perf_ibs_pm_init(void) { }
 
 #endif
 
-static int
-perf_ibs_cpu_notifier(struct notifier_block *self, unsigned long action, void *hcpu)
+static int x86_pmu_amd_ibs_dying_cpu(unsigned int cpu)
 {
-	switch (action & ~CPU_TASKS_FROZEN) {
-	case CPU_STARTING:
-		setup_APIC_ibs(NULL);
-		break;
-	case CPU_DYING:
-		clear_APIC_ibs(NULL);
-		break;
-	default:
-		break;
-	}
-
-	return NOTIFY_OK;
+	clear_APIC_ibs();
+	return 0;
 }
 
 static __init int amd_ibs_init(void)
 {
 	u32 caps;
-	int ret = -EINVAL;
 
 	caps = __get_ibs_caps();
 	if (!caps)
@@ -966,22 +998,25 @@ static __init int amd_ibs_init(void)
 	ibs_eilvt_setup();
 
 	if (!ibs_eilvt_valid())
-		goto out;
+		return -EINVAL;
 
 	perf_ibs_pm_init();
-	cpu_notifier_register_begin();
+
 	ibs_caps = caps;
 	/* make ibs_caps visible to other cpus: */
 	smp_mb();
-	smp_call_function(setup_APIC_ibs, NULL, 1);
-	__perf_cpu_notifier(perf_ibs_cpu_notifier);
-	cpu_notifier_register_done();
+	/*
+	 * x86_pmu_amd_ibs_starting_cpu will be called from core on
+	 * all online cpus.
+	 */
+	cpuhp_setup_state(CPUHP_AP_PERF_X86_AMD_IBS_STARTING,
+			  "AP_PERF_X86_AMD_IBS_STARTING",
+			  x86_pmu_amd_ibs_starting_cpu,
+			  x86_pmu_amd_ibs_dying_cpu);
 
-	ret = perf_event_ibs_init();
-out:
-	if (ret)
-		pr_err("Failed to setup IBS, %d\n", ret);
-	return ret;
+	perf_event_ibs_init();
+
+	return 0;
 }
 
 /* Since we need the pci subsystem to init ibs we can't do this earlier: */

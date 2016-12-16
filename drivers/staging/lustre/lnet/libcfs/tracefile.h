@@ -15,11 +15,7 @@
  *
  * You should have received a copy of the GNU General Public License
  * version 2 along with this program; If not, see
- * http://www.sun.com/software/products/lustre/docs/GPLv2.pdf
- *
- * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
- * CA 95054 USA or visit www.sun.com if you need additional information or
- * have any questions.
+ * http://www.gnu.org/licenses/gpl-2.0.html
  *
  * GPL HEADER END
  */
@@ -87,7 +83,7 @@ void libcfs_unregister_panic_notifier(void);
 extern int  libcfs_panic_in_progress;
 int cfs_trace_max_debug_mb(void);
 
-#define TCD_MAX_PAGES (5 << (20 - PAGE_CACHE_SHIFT))
+#define TCD_MAX_PAGES (5 << (20 - PAGE_SHIFT))
 #define TCD_STOCK_PAGES (TCD_MAX_PAGES)
 #define CFS_TRACEFILE_SIZE (500 << 20)
 
@@ -96,7 +92,7 @@ int cfs_trace_max_debug_mb(void);
 /*
  * Private declare for tracefile
  */
-#define TCD_MAX_PAGES (5 << (20 - PAGE_CACHE_SHIFT))
+#define TCD_MAX_PAGES (5 << (20 - PAGE_SHIFT))
 #define TCD_STOCK_PAGES (TCD_MAX_PAGES)
 
 #define CFS_TRACEFILE_SIZE (500 << 20)
@@ -257,7 +253,7 @@ do {								    \
 do {								    \
 	__LASSERT(tage);					\
 	__LASSERT(tage->page);				  \
-	__LASSERT(tage->used <= PAGE_CACHE_SIZE);			 \
+	__LASSERT(tage->used <= PAGE_SIZE);			 \
 	__LASSERT(page_count(tage->page) > 0);		      \
 } while (0)
 
